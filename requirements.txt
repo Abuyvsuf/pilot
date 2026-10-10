@@ -1,0 +1,7 @@
+watchdog
+pywinauto
+pyautogui
+requests
+pyzbar
+pymupdf
+pillow
