@@ -7,9 +7,14 @@
 #   3. Select the record, right-click it > EMR prescription > Upload file.
 #   4. Windows file dialog: the full path of the scan > Open.
 #   5. Back in Nexus: Select file.
-#   6. The result goes to n8n (Telegram alert); the scan moves to Z:\done or Z:\failed.
+#   6. The result goes to n8n (Telegram alert); the scan moves to Z:\done, Z:\failed or Z:\check.
 # Every step is checked. When something does not match, the agent stops and reports
-# instead of guessing, so a form is never attached to the wrong record.
+# instead of guessing, so a form is never attached to the wrong record or twice.
+#   status "success"   = attached
+#   status "failed"    = stopped BEFORE "Select file" was clicked, nothing attached (safe to retry)
+#   status "uncertain" = stopped AFTER "Select file" was clicked: check the record in Nexus by hand
+#   status "skipped"   = this scan was already attached (or attempted) earlier
+import ctypes
 import datetime
 import logging
 import operator
@@ -28,11 +33,17 @@ from watchdog.observers import Observer
 WATCH_DIR = Path("Z:/")
 N8N_WEBHOOK = "https://abvyusuf.app.n8n.cloud/webhook/nexus-attach-result"
 ALLOWED_EXT = {".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff"}
-PROCESS_EXISTING_ON_START = True  # also handle scans already waiting in Z:\ at startup
+PROCESS_EXISTING_ON_START = True  # also handle scans already waiting in Z:\
+RESCAN_SECONDS = 60  # re-check Z:\ this often, in case the folder watcher missed something
 USE_BARCODE = True  # if the form has a readable barcode, it must match the filename
 
 NEXUS_TITLE = "Nexus Pro"
 CENTER_VALUE = "0"
+# Programs that are never Nexus, even if their window title mentions "Nexus Pro"
+NOT_NEXUS_EXE = {"chrome.exe", "msedge.exe", "firefox.exe", "opera.exe", "brave.exe",
+                 "iexplore.exe", "telegram.exe", "whatsapp.exe", "explorer.exe", "notepad.exe",
+                 "notepad++.exe", "code.exe", "python.exe", "pythonw.exe", "cmd.exe",
+                 "windowsterminal.exe", "winword.exe", "excel.exe", "outlook.exe", "teams.exe"}
 
 # Texts on the Nexus screens (regular expressions, not case sensitive)
 PATIENTS_TITLE = r"Patients"
@@ -41,16 +52,19 @@ CENTER_LABEL = r"^\s{0,}Cent(er|re)\s{0,}:?\s{0,}$"
 CASE_LABEL = r"^\s{0,}Case\s{0,}#\s{0,}:?\s{0,}$"
 CASE_LABEL_LOOSE = r"Case\s{0,}#"
 SEARCH_TITLE = r"^\s{0,}&?Search\s{0,}$"
-EMR_TITLE = r"EMR\s{0,}prescription"
-UPLOAD_PRESCRIPTION_TITLE = r"Upload\s{0,}prescription"
-UPLOAD_FILE_TITLE = r"Upload\s{0,}file"
-SELECT_FILE_TITLE = r"Select\s{0,}file"
+EMR_TITLE = r"^\s{0,}&?EMR\s{0,}prescription\s{0,}(\.\.\.)?\s{0,}(\t.{0,})?$"
+UPLOAD_PRESCRIPTION_TITLE = r"^\s{0,}&?Upload\s{0,}prescription\s{0,}(\.\.\.)?\s{0,}$"
+UPLOAD_FILE_TITLE = r"^\s{0,}&?Upload\s{0,}file\s{0,}(\.\.\.)?\s{0,}$"
+SELECT_FILE_TITLE = r"^\s{0,}&?Select\s{0,}file\s{0,}(\.\.\.)?\s{0,}$"
 ERROR_WORDS = r"error|fail|invalid|unable|cannot|can't|not found|denied|exception|already"
+QUESTION_BUTTONS = r"^\s{0,}&?(Cancel|No)\s{0,}$"
 # ----------------------------------------------------------
 
 DONE_DIR = WATCH_DIR / "done"
 FAILED_DIR = WATCH_DIR / "failed"
-LEDGER = DONE_DIR / "attached_files.txt"
+CHECK_DIR = WATCH_DIR / "check"
+# Kept on the local disk next to this script, so a network drop cannot lose it.
+LEDGER = Path(__file__).resolve().with_name("attached_files.txt")
 
 MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
@@ -62,9 +76,16 @@ INPUT_SKIP = ["Text", "Group", "Window", "TitleBar", "MenuBar", "Menu", "MenuIte
               "Thumb", "Separator", "Hyperlink", "Tab", "TabItem", "Table", "DataGrid",
               "List", "Tree", "TreeItem", "ListItem", "DataItem", "Button"]
 RECORD_SKIP = ["Window", "TitleBar", "StatusBar", "MenuBar", "Menu", "MenuItem",
-               "Button", "TabItem", "ComboBox", "Spinner", "ToolBar"]
+               "Button", "TabItem", "ComboBox", "Spinner", "ToolBar", "Header", "HeaderItem"]
+ROW_TYPES = ["DataItem", "ListItem", "TreeItem", "Custom"]
 RECORD_RANK = {"DataItem": 0, "ListItem": 0, "TreeItem": 0, "Custom": 1, "Text": 2, "Edit": 3}
 CLICKABLE = ["Button", "SplitButton", "MenuItem", "ListItem", "Hyperlink"]
+BUTTON_SKIP = ["TitleBar", "Window", "Edit", "Text", "HeaderItem"]
+
+
+class UncertainAttach(RuntimeError):
+    # Raised for any problem after "Select file" was clicked: the form may already be attached.
+    pass
 
 
 # ------------------------- case number -------------------------
@@ -147,9 +168,9 @@ def case_from_file(path):
                 bc_case, bc_date = parse_case(code)
             except ValueError:
                 logging.info("Barcode '%s' is not a case number; using the filename", code)
-    if file_case and bc_case and file_case != bc_case:
-        raise RuntimeError("Barcode says %s but filename says %s - check this form by hand"
-                           % (bc_case, file_case))
+    if file_case and bc_case and (file_case, file_date) != (bc_case, bc_date):
+        raise RuntimeError("Barcode says %s (%s) but filename says %s (%s) - check this form by hand"
+                           % (bc_case, nexus_date_text(bc_date), file_case, nexus_date_text(file_date)))
     if file_case:
         return file_case, file_date
     if bc_case:
@@ -158,6 +179,14 @@ def case_from_file(path):
 
 
 # ------------------------- UI helpers -------------------------
+
+class Run:
+    # The Nexus window being driven for one scan.
+    def __init__(self, win):
+        self.win = win
+        self.pid = win.process_id()
+        self.main = win.handle
+
 
 def safe(fn, default=None):
     try:
@@ -185,8 +214,17 @@ def ctype(c):
     return safe(lambda: c.element_info.control_type, "") or ""
 
 
+def name_of(c):
+    return (safe(c.window_text, "") or "").strip()
+
+
 def rect(c):
     return safe(lambda: c.rectangle())
+
+
+def rect_key(c):
+    r = rect(c)
+    return (r.left, r.top, r.right, r.bottom) if r is not None else None
 
 
 def top_left(c):
@@ -209,6 +247,11 @@ def wait_for(fn, timeout, interval=0.5):
         time.sleep(interval)
 
 
+def exe_of(pid):
+    from pywinauto.application import process_module
+    return Path(safe(lambda: process_module(pid), "") or "").name.lower()
+
+
 def visible_titles():
     from pywinauto import Desktop
     titles = []
@@ -222,7 +265,7 @@ def visible_titles():
 
 
 def find_main_window(timeout=10):
-    # Several windows can be titled Nexus Pro. Take the biggest visible one.
+    # Several windows can be titled Nexus Pro. Take the biggest visible one of a non-browser program.
     from pywinauto import Desktop
     end = time.time() + timeout
     while time.time() < end:
@@ -237,9 +280,15 @@ def find_main_window(timeout=10):
                 continue
             if "console" in cls or "cascadia" in cls or "terminal" in cls:
                 continue
+            if exe_of(safe(w.process_id)) in NOT_NEXUS_EXE:
+                continue
             if is_visible(w):
                 cands.append(w)
         if cands:
+            if len({safe(c.process_id) for c in cands}) > 1:
+                logging.error("More than one program has a '%s' window: %s",
+                              NEXUS_TITLE, [c.window_text() for c in cands])
+                return None
             cands.sort(key=area, reverse=True)
             return cands[0]
         time.sleep(0.5)
@@ -248,56 +297,58 @@ def find_main_window(timeout=10):
     return None
 
 
-def all_roots(win, pid):
-    # The main window plus every other visible top-level window of the Nexus process
-    # (pop-up menus, the EMR window, dialogs). Other programs are never searched.
-    from pywinauto import Desktop
-    roots = [win]
-    for w in Desktop(backend="uia").windows():
-        try:
-            if w.handle != win.handle and w.process_id() == pid and is_visible(w):
-                roots.append(w)
-        except Exception:
-            pass
-    return roots
-
-
-def top_handles(pid):
-    from pywinauto import Desktop
-    handles = set()
-    for w in Desktop(backend="uia").windows():
-        try:
-            if w.process_id() == pid and is_visible(w):
-                handles.add(w.handle)
-        except Exception:
-            pass
-    return handles
-
-
-def nexus_dialogs(pid):
-    from pywinauto import Desktop
+def nexus_windows(pid):
+    # Real top-level windows of Nexus, including OWNED ones (EMR form, file dialog, message boxes).
+    # The UIA desktop lists only un-owned windows, so enumerate with win32 and wrap them for UIA.
+    from pywinauto import findwindows
+    from pywinauto.controls.uiawrapper import UIAWrapper
+    from pywinauto.uia_element_info import UIAElementInfo
     found = []
-    for d in Desktop(backend="uia").windows(class_name="#32770"):
-        try:
-            if d.process_id() == pid and is_visible(d):
-                found.append(d)
-        except Exception:
-            pass
+    handles = safe(lambda: findwindows.find_windows(backend="win32", process=pid, visible_only=True), []) or []
+    for h in handles:
+        w = safe(lambda: UIAWrapper(UIAElementInfo(h)))
+        if w is not None:
+            found.append(w)
     return found
 
 
-def new_dialogs(pid, before):
-    return [d for d in nexus_dialogs(pid) if safe(lambda: d.handle) not in before]
+def window_class(w):
+    return safe(lambda: w.element_info.class_name, "") or ""
+
+
+def nexus_dialogs(pid):
+    return [w for w in nexus_windows(pid) if window_class(w) == "#32770"]
+
+
+def new_windows(run, before):
+    # Top-level Nexus windows that appeared after the "before" snapshot (menus and tooltips excluded).
+    return [w for w in nexus_windows(run.pid)
+            if safe(lambda: w.handle) not in before and safe(lambda: w.handle) != run.main
+            and window_class(w) not in ("#32768", "tooltips_class32")]
+
+
+def handles_of(windows):
+    return {safe(lambda: w.handle) for w in windows}
+
+
+def all_roots(run):
+    # The main window plus every other visible top-level window of the Nexus process.
+    # Other programs are never searched.
+    return [run.win] + [w for w in nexus_windows(run.pid) if safe(lambda: w.handle) != run.main]
 
 
 def dialog_text(d):
     parts = []
     for c in safe(d.descendants, []):
         if ctype(c) == "Text":
-            t = (safe(c.window_text, "") or "").strip()
+            t = name_of(c)
             if t and t not in parts:
                 parts.append(t)
-    return " ".join(parts)[:300] or (safe(d.window_text, "") or "")
+    return " ".join(parts)[:300] or name_of(d)
+
+
+def button_names(d):
+    return [name_of(b) for b in safe(lambda: d.descendants(control_type="Button"), [])]
 
 
 def close_window(w):
@@ -305,21 +356,83 @@ def close_window(w):
     time.sleep(0.5)
 
 
-def assert_focus(pid):
-    # Keys are only sent while Nexus (or its own dialog) is the active window.
-    from pywinauto import handleprops, win32functions
-    h = win32functions.GetForegroundWindow()
-    if h and handleprops.processid(h) != pid:
-        raise RuntimeError("Another window took the focus ('%s'); stopped so nothing is typed into it"
-                           % safe(lambda: handleprops.text(h), "?"))
+def foreground():
+    user32 = ctypes.windll.user32
+    user32.GetForegroundWindow.restype = ctypes.c_void_p
+    return user32.GetForegroundWindow() or 0
+
+
+def ga_root(h):
+    # The top-level window that contains window h.
+    user32 = ctypes.windll.user32
+    user32.GetAncestor.restype = ctypes.c_void_p
+    user32.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+    return user32.GetAncestor(h, 2) or 0
+
+
+def root_at(x, y):
+    # The top-level window that is really on screen at (x, y).
+    import ctypes.wintypes
+    user32 = ctypes.windll.user32
+    user32.WindowFromPoint.restype = ctypes.c_void_p
+    user32.WindowFromPoint.argtypes = [ctypes.wintypes.POINT]
+    h = user32.WindowFromPoint(ctypes.wintypes.POINT(x, y))
+    return ga_root(h) if h else 0
+
+
+def root_of(c):
+    # The top-level window that holds control c (0 if unknown).
+    p = c
+    for _ in range(50):
+        h = safe(lambda: p.handle)
+        if h:
+            return ga_root(h)
+        p = safe(p.parent)
+        if p is None:
+            return 0
+    return 0
+
+
+def window_pid(h):
+    from pywinauto import handleprops
+    return safe(lambda: handleprops.processid(h))
+
+
+def assert_focus(run, expected=0):
+    # Keys are only sent while the window we clicked into (or at least Nexus) is the active window.
+    h = foreground()
+    ok = bool(h) and (h == expected if expected else window_pid(h) == run.pid)
+    if not ok:
+        from pywinauto import handleprops
+        raise RuntimeError("The active window is '%s', not the expected Nexus window; "
+                           "stopped so nothing is typed into it" % safe(lambda: handleprops.text(h), "?"))
+
+
+def click_at(run, x, y, expect_root=0, button="left"):
+    # Clicks only when the spot shows the expected Nexus window (nothing else on top of it).
+    # Returns the top-level window that was clicked.
+    import pyautogui
+    root = root_at(x, y)
+    if not root or window_pid(root) != run.pid or (expect_root and root != expect_root):
+        raise RuntimeError("Another window covers the spot to click (%d,%d); stopped" % (x, y))
+    pyautogui.click(x, y, button=button)
+    return root
+
+
+def click(run, c, button="left"):
+    r = rect(c)
+    if r is None:
+        raise RuntimeError("'%s' disappeared before it could be clicked" % name_of(c))
+    return click_at(run, (r.left + r.right) // 2, (r.top + r.bottom) // 2, root_of(c), button)
 
 
 def find_all(parents, pattern, skip=(), only=None):
+    # Visible controls whose name matches; the same control reached twice is listed once.
     pat = re.compile(pattern, re.IGNORECASE)
     found = []
+    keys = set()
     for parent in parents:
-        items = safe(parent.descendants, [])
-        for c in items:
+        for c in safe(parent.descendants, []):
             try:
                 name = c.window_text() or ""
                 if not name or not pat.search(name):
@@ -327,8 +440,13 @@ def find_all(parents, pattern, skip=(), only=None):
                 t = c.element_info.control_type
                 if t in skip or (only and t not in only):
                     continue
-                if is_visible(c):
-                    found.append(c)
+                if not is_visible(c):
+                    continue
+                k = (t, name, rect_key(c))
+                if k in keys:
+                    continue
+                keys.add(k)
+                found.append(c)
             except Exception:
                 continue
     return found
@@ -371,7 +489,7 @@ def nearest_to(cands, ref, above=False):
 def looks_like_input(c):
     if ctype(c) in ("Edit", "ComboBox", "Spinner"):
         return True
-    cls = (safe(lambda: c.element_info.class_name, "") or "").lower()
+    cls = window_class(c).lower()
     return any(k in cls for k in ("date", "edit", "combo", "mask"))
 
 
@@ -402,30 +520,30 @@ def input_right_of(win, label, max_gap=300):
     return best[1] if best else None
 
 
-def field_for(win, label):
+def field_for(run, label):
     if ctype(label) in ("Edit", "ComboBox"):
         return label
-    box = input_right_of(win, label)
+    box = input_right_of(run.win, label)
     if box is None:
         from pywinauto import Desktop
         lr = rect(label)
         el = safe(lambda: Desktop(backend="uia").from_point(lr.right + 60, (lr.top + lr.bottom) // 2))
         er = rect(el) if el is not None else None
-        if er is not None and ctype(el) not in INPUT_SKIP and er.height() <= lr.height() + 40:
+        if (er is not None and ctype(el) not in INPUT_SKIP and er.height() <= lr.height() + 40
+                and safe(el.process_id) == run.pid):
             box = el
     return box
 
 
-def click_field(label, box):
+def click_field(run, label, box):
     # Same spot that already worked for Case #: 60 px right of the label,
     # unless the box was found somewhere else, then its centre.
-    import pyautogui
     lr = rect(label)
     x, y = lr.right + 60, (lr.top + lr.bottom) // 2
     br = rect(box) if box is not None else None
     if br is not None and not (br.left <= x <= br.right and br.top <= y <= br.bottom):
         x, y = (br.left + br.right) // 2, (br.top + br.bottom) // 2
-    pyautogui.click(x, y)
+    return click_at(run, x, y, root_of(box) if box is not None else root_of(label))
 
 
 def read_value(c):
@@ -444,11 +562,11 @@ def set_value(c, text):
     return safe(lambda: c.iface_value.SetValue(text) or True, False)
 
 
-def fill_text(pid, label, box, text):
+def fill_text(run, label, box, text):
     import pyautogui
-    click_field(label, box)
+    root = click_field(run, label, box)
     time.sleep(0.3)
-    assert_focus(pid)
+    assert_focus(run, root)
     if box is not None and ctype(box) == "ComboBox":
         pyautogui.hotkey("ctrl", "a")
     else:
@@ -469,8 +587,7 @@ def date_seen(box):
 
 def native_date_picker(box):
     handle = safe(lambda: box.handle)
-    cls = (safe(lambda: box.element_info.class_name, "") or "").lower()
-    if not handle or "datetimepick" not in cls:
+    if not handle or "datetimepick" not in window_class(box).lower():
         return None
     from pywinauto.controls.common_controls import DateTimePickerWrapper
     return safe(lambda: DateTimePickerWrapper(handle))
@@ -481,7 +598,20 @@ def picker_date(dtp):
     return datetime.date(t.wYear, t.wMonth, t.wDay)
 
 
-def set_date(pid, label, box, d):
+def focus_box(run, box):
+    # Keys for the date picker only go out when the picker itself has the keyboard focus.
+    safe(box.set_focus)
+    time.sleep(0.3)
+    assert_focus(run, root_of(box))
+    if not safe(box.has_keyboard_focus, False):
+        click(run, box)
+        time.sleep(0.3)
+        assert_focus(run, root_of(box))
+        if not safe(box.has_keyboard_focus, False):
+            raise RuntimeError("Date box did not take the keyboard focus; the date was not changed")
+
+
+def set_date(run, label, box, d):
     import pyautogui
     want = nexus_date_text(d)
     if box is None:
@@ -493,18 +623,14 @@ def set_date(pid, label, box, d):
             dtp.set_time(year=d.year, month=d.month, day=d.day)
         except Exception as e:
             logging.warning("Date picker could not be set directly (%s); typing instead", e)
-        box.set_focus()
-        time.sleep(0.3)
-        assert_focus(pid)
+        focus_box(run, box)
         pyautogui.press("up")
         pyautogui.press("down")
         time.sleep(0.3)
         if safe(lambda: picker_date(dtp)) == d:
             return "verified"
         for use_right in (True, False):
-            box.set_focus()
-            time.sleep(0.3)
-            assert_focus(pid)
+            focus_box(run, box)
             for i, part in enumerate(("%02d" % d.day, "%02d" % d.month, "%04d" % d.year)):
                 if i and use_right:
                     pyautogui.press("right")
@@ -515,7 +641,7 @@ def set_date(pid, label, box, d):
         raise RuntimeError("Date field shows %s instead of %s"
                            % (safe(lambda: picker_date(dtp)), want))
     # Text-style date box
-    fill_text(pid, label, box, want)
+    fill_text(run, label, box, want)
     seen = date_seen(box)
     if seen == d:
         return "verified"
@@ -537,7 +663,8 @@ def date_still_ok(box, d):
     return seen is None or seen == d
 
 
-def fill_search_form(win, pid, case_number, case_date):
+def fill_search_form(run, case_number, case_date):
+    win = run.win
     case_label = (find_one([win], CASE_LABEL, prefer=["Text"], skip=LABEL_SKIP, timeout=10)
                   or find_one([win], CASE_LABEL_LOOSE, prefer=["Text", "Edit"], skip=LABEL_SKIP, timeout=1))
     if case_label is None:
@@ -552,18 +679,22 @@ def fill_search_form(win, pid, case_number, case_date):
         raise RuntimeError("'Center' field not found on the Patients screen")
 
     # Date (the case date)
-    date_box = field_for(win, date_label)
-    date_note = set_date(pid, date_label, date_box, case_date)
+    date_box = field_for(run, date_label)
+    date_note = set_date(run, date_label, date_box, case_date)
     logging.info("Date set to %s (%s)", nexus_date_text(case_date), date_note)
 
     # Center
-    center_box = field_for(win, center_label)
-    center_seen = fill_text(pid, center_label, center_box, CENTER_VALUE)
-    logging.info("Center set to %s (box reads '%s')", CENTER_VALUE, center_seen)
+    center_box = field_for(run, center_label)
+    center_seen = fill_text(run, center_label, center_box, CENTER_VALUE).strip()
+    m = re.match(r"^\s{0,}(\d+)", center_seen)
+    if m and m.group(1) != CENTER_VALUE:
+        raise RuntimeError("Center shows '%s' instead of %s" % (center_seen, CENTER_VALUE))
+    center_note = ("reads '%s'" % center_seen) if center_seen else "typed, not readable"
+    logging.info("Center set to %s (%s)", CENTER_VALUE, center_note)
 
     # Case #
-    case_box = field_for(win, case_label)
-    seen = fill_text(pid, case_label, case_box, case_number)
+    case_box = field_for(run, case_label)
+    seen = fill_text(run, case_label, case_box, case_number)
     if seen and seen.strip() != case_number:
         set_value(case_box, case_number)
         time.sleep(0.3)
@@ -574,79 +705,184 @@ def fill_search_form(win, pid, case_number, case_date):
 
     # Changing Center can reset other fields: check the date once more.
     if not date_still_ok(date_box, case_date):
-        date_note = set_date(pid, date_label, date_box, case_date)
-    return case_label, case_box, [rect(b) for b in (date_box, center_box, case_box) if b is not None], date_note
+        date_note = set_date(run, date_label, date_box, case_date)
+    avoid = [rect(b) for b in (date_box, center_box, case_box) if b is not None]
+    notes = "Date %s %s, Center %s %s" % (nexus_date_text(case_date), date_note, CENTER_VALUE, center_note)
+    return case_label, case_box, avoid, notes
+
+
+def record_pattern(case_number):
+    # Exactly this case number, not a longer number or a suffixed sub-case containing it.
+    numbers = [re.escape(case_number), re.escape(case_number.replace("-", ""))]
+    return re.compile(r"(?<![\w/-])(%s)(?![\w/-])" % "|".join(numbers))
+
+
+def record_text(c):
+    t = safe(c.window_text, "") or ""
+    if ctype(c) in ROW_TYPES + ["Text", "Edit", ""]:
+        t = t + " " + read_value(c)
+    return t
+
+
+def matching_records(win, pat, avoid, rows_only):
+    cands = []
+    for c in safe(win.descendants, []):
+        t = ctype(c)
+        if t in RECORD_SKIP or (rows_only and t not in ROW_TYPES):
+            continue
+        if not is_visible(c) or not pat.search(record_text(c)):
+            continue
+        r = rect(c)
+        if r is None or any(overlaps(r, a) for a in avoid if a is not None):
+            continue
+        cands.append(c)
+    return cands
 
 
 def find_record(win, case_number, avoid, timeout):
-    # A search result showing exactly this case number (not a longer number containing it).
-    numbers = [re.escape(case_number), re.escape(case_number.replace("-", ""))]
-    pattern = r"(?<![\d-])(%s)(?![\d-])" % "|".join(numbers)
+    # Returns the one result row for this case, None if there is none,
+    # and raises if more than one row shows it.
+    pat = record_pattern(case_number)
+    end = time.time() + timeout
+    cands = []
+    while True:
+        final = time.time() >= end
+        cands = matching_records(win, pat, avoid, rows_only=not final)
+        if cands or final:
+            break
+        time.sleep(0.5)
+    if not cands:
+        return None
+    time.sleep(1)  # let the list finish loading, then look again
+    cands = matching_records(win, pat, avoid, rows_only=False) or cands
+    best = min(RECORD_RANK.get(ctype(c), 5) for c in cands)
+    cands = sorted([c for c in cands if RECORD_RANK.get(ctype(c), 5) == best], key=top_left)
+    rows = []
+    for c in cands:
+        r = rect(c)
+        if not any(r.top <= o.bottom and r.bottom >= o.top for o in rows):
+            rows.append(r)
+    if len(rows) > 1:
+        raise RuntimeError("%d records show case %s; attach this one by hand" % (len(rows), case_number))
+    return cands[0]
 
-    def look():
-        cands = []
-        for c in find_all([win], pattern, RECORD_SKIP):
-            r = rect(c)
-            if r is None or any(overlaps(r, a) for a in avoid if a is not None):
-                continue
-            cands.append(c)
-        if not cands:
-            return None
-        cands.sort(key=lambda c: (RECORD_RANK.get(ctype(c), 5),) + top_left(c))
-        return cands[0]
-    return wait_for(look, timeout)
 
-
-def search_record(win, pid, case_number, case_label, case_box, avoid):
+def search_record(run, case_number, case_label, case_box, avoid):
     import pyautogui
+    win = run.win
     search = find_one(
         [win], SEARCH_TITLE, prefer=CLICKABLE,
         skip=["TabItem", "Edit", "HeaderItem", "TitleBar", "Window", "Text"], timeout=5,
         sort_key=lambda c: (top_left(c)[0], -(rect(c).right if rect(c) is not None else 0)))
     if search is not None:
-        search.click_input()
+        click(run, search)
         record = find_record(win, case_number, avoid, 12)
         if record:
             return record
         logging.warning("No result after clicking Search; trying Enter in Case #")
     else:
         logging.warning("'Search' button not found; trying Enter in Case #")
-    click_field(case_label, case_box)
+    root = click_field(run, case_label, case_box)
     time.sleep(0.3)
-    assert_focus(pid)
+    assert_focus(run, root)
     pyautogui.press("enter")
     return find_record(win, case_number, avoid, 10)
 
 
-def click_emr_prescription(win, pid, record):
+def popup_menu_items(run, before):
+    items = []
+    for w in nexus_windows(run.pid):
+        if safe(lambda: w.handle) in before:
+            continue
+        items.extend(i for i in safe(lambda: w.descendants(control_type="MenuItem"), []) if is_visible(i))
+    return sorted(items, key=top_left)
+
+
+def escape_menu(run):
     import pyautogui
-    before = top_handles(pid)
-    record.click_input()  # select the row first so the menu acts on this record
-    time.sleep(0.5)
-    record.right_click_input()
-    time.sleep(0.8)
-
-    def popups():
-        return [w for w in all_roots(win, pid)[1:] if safe(lambda: w.handle) not in before]
-
-    item = find_one(popups, EMR_TITLE, prefer=["MenuItem"], timeout=4)
-    if item is not None:
-        item.click_input()
-        return
-    items = [i for w in popups() for i in safe(lambda: w.descendants(control_type="MenuItem"), [])
-             if is_visible(i)]
-    names = [(safe(i.window_text, "") or "").strip() for i in items]
-    if len(items) >= 2 and not any(names):
-        # Menu without readable names: EMR prescription is the second last option.
-        items[-2].click_input()
-        return
-    if popups():
-        assert_focus(pid)
+    if safe(lambda: assert_focus(run) or True, False):
         pyautogui.press("escape")
+        time.sleep(0.3)
+
+
+def click_emr_prescription(run, case_number, record, avoid):
+    before = handles_of(nexus_windows(run.pid))
+    r_before = rect_key(record)
+    click(run, record)  # select the row first so the menu acts on this record
+    time.sleep(0.5)
+    # Look again: the same spot must still show this case number.
+    same = [c for c in matching_records(run.win, record_pattern(case_number), avoid, rows_only=False)
+            if rect_key(c) == r_before]
+    if not same:
+        raise RuntimeError("The result list changed before the right-click; stopped")
+    click(run, same[0], "right")
+
+    items = wait_for(lambda: popup_menu_items(run, before), 4) or []
     if not items:
         raise RuntimeError("Right-click menu did not open on the record")
-    raise RuntimeError("'EMR prescription' not in the right-click menu (options: %s)"
+    names = [name_of(i) for i in items]
+    hits = [i for i in items if re.search(EMR_TITLE, name_of(i), re.IGNORECASE)]
+    if len(hits) == 1:
+        if len(items) < 2 or top_left(hits[0]) != top_left(items[-2]):
+            logging.warning("EMR prescription is not the second last option here (options: %s)", names)
+        click(run, hits[0])
+        return
+    if len(items) >= 2 and not any(names):
+        # Menu without readable names: EMR prescription is the second last option.
+        click(run, items[-2])
+        return
+    escape_menu(run)
+    raise RuntimeError("'EMR prescription' not found exactly once in the right-click menu (options: %s)"
                        % ", ".join(n for n in names if n))
+
+
+def window_of(c):
+    # The window (EMR form, MDI child or main window) that holds a control.
+    p = c
+    for _ in range(40):
+        p = safe(p.parent)
+        if p is None:
+            return None
+        if ctype(p) == "Window":
+            return p
+    return None
+
+
+def upload_buttons(run, pattern):
+    return find_all(all_roots(run), pattern, BUTTON_SKIP, ["Button", "SplitButton"])
+
+
+def close_leftover_upload_windows(run):
+    # An EMR upload window still open from an earlier scan must never receive this scan.
+    for pattern in (UPLOAD_FILE_TITLE, SELECT_FILE_TITLE):
+        for b in upload_buttons(run, pattern):
+            host = window_of(b)
+            if host is not None and safe(lambda: host.handle) != run.main:
+                logging.info("Closing a leftover Nexus window: %s", name_of(host))
+                close_window(host)
+    time.sleep(1)
+    for w in nexus_dialogs(run.pid):
+        raise RuntimeError("Closing a leftover Nexus window brought up a message: %s; answer it by hand"
+                           % dialog_text(w))
+    for pattern in (UPLOAD_FILE_TITLE, SELECT_FILE_TITLE):
+        for b in upload_buttons(run, pattern):
+            host = window_of(b)
+            if host is not None and safe(lambda: host.handle) != run.main:
+                raise RuntimeError("An EMR upload window from an earlier scan is still open; close it by hand")
+
+
+def the_only(run, pattern, label, roots=None, timeout=15):
+    # Waits for exactly one visible button with this name and returns it.
+    def look():
+        found = find_all(roots() if roots else all_roots(run), pattern, BUTTON_SKIP, ["Button", "SplitButton"])
+        return found or None
+    found = wait_for(look, timeout) or []
+    if not found:
+        return None
+    if len(found) > 1:
+        raise RuntimeError("%d '%s' buttons are open in Nexus; stopped so the file cannot go to "
+                           "another record" % (len(found), label))
+    return found[0]
 
 
 def file_name_box(dlg):
@@ -655,7 +891,7 @@ def file_name_box(dlg):
         if safe(lambda: e.element_info.automation_id) in ("1148", "1152"):
             return e
     for e in edits:
-        if re.match(r"^\s{0,}File\s{0,}name", safe(e.window_text, "") or "", re.IGNORECASE):
+        if re.match(r"^\s{0,}File\s{0,}name", name_of(e), re.IGNORECASE):
             return e
     return None
 
@@ -666,23 +902,33 @@ def same_path(a, b):
     return norm(a) == norm(b)
 
 
-def choose_file(pid, before, file_path):
+def choose_file(run, before, file_path):
     import pyautogui
-    dlg = wait_for(lambda: (new_dialogs(pid, before) or [None])[0], 15)
+
+    def dialog():
+        return ([d for d in nexus_dialogs(run.pid) if safe(lambda: d.handle) not in before] or [None])[0]
+
+    dlg = wait_for(dialog, 15)
     if dlg is None:
-        raise RuntimeError("File dialog did not open after 'Upload file'")
+        late = wait_for(dialog, 30)  # never leave a late dialog open for the next scan
+        if late is not None:
+            close_window(late)
+        raise RuntimeError("File dialog did not open within 15 s after 'Upload file'")
     box = wait_for(lambda: file_name_box(dlg), 5)
     if box is None:
         text = dialog_text(dlg)
         close_window(dlg)
         raise RuntimeError("Nexus showed a message instead of the file dialog: %s" % text)
+    if foreground() != dlg.handle:
+        safe(dlg.set_focus)
+        time.sleep(0.5)
 
     full = str(file_path).replace("/", "\\")
     seen = ""
     for attempt in range(2):
-        box.click_input()
+        click(run, box)
         time.sleep(0.3)
-        assert_focus(pid)
+        assert_focus(run, dlg.handle)
         pyautogui.hotkey("ctrl", "a")
         if attempt == 0:
             pyautogui.write(full, interval=0.01)
@@ -696,14 +942,15 @@ def choose_file(pid, before, file_path):
         close_window(dlg)
         raise RuntimeError("File dialog shows '%s' instead of %s" % (seen, full))
 
-    box.click_input()
+    click(run, box)
     time.sleep(0.2)
-    assert_focus(pid)
+    assert_focus(run, dlg.handle)
     pyautogui.press("end")
     pyautogui.press("enter")
     if wait_for(lambda: not is_visible(dlg), 10):
         return
-    msgs = [m for m in new_dialogs(pid, before) if safe(lambda: m.handle) != safe(lambda: dlg.handle)]
+    msgs = [m for m in nexus_dialogs(run.pid)
+            if safe(lambda: m.handle) not in before and safe(lambda: m.handle) != dlg.handle]
     text = " | ".join(dialog_text(m) for m in msgs) or "no message"
     for m in msgs:
         close_window(m)
@@ -711,61 +958,86 @@ def choose_file(pid, before, file_path):
     raise RuntimeError("File dialog did not accept %s (%s)" % (full, text))
 
 
-def upload_file(win, pid, file_path):
-    def roots():
-        return all_roots(win, pid)
+def mark_pending(key, case_number):
+    # Written BEFORE "Select file" is clicked, so a crash right after the click can never
+    # lead to the same scan being attached twice. If it cannot be written, nothing is clicked.
+    with LEDGER.open("a", encoding="utf-8") as f:
+        f.write("%s\t%s\tpending\t%s\n" % (key, case_number, time.strftime("%Y-%m-%d %H:%M:%S")))
 
-    skip = ["TitleBar", "Window", "Edit"]
-    upload = find_one(roots, UPLOAD_FILE_TITLE, prefer=["Button"], skip=skip, timeout=10)
+
+def upload_file(run, case_number, file_path, key, state):
+    upload = the_only(run, UPLOAD_FILE_TITLE, "Upload file", timeout=10)
     if upload is None:
         # Older layout: EMR prescription > Upload prescription > Upload file
-        up = find_one(roots, UPLOAD_PRESCRIPTION_TITLE, prefer=["MenuItem", "Button"], skip=skip, timeout=2)
+        up = find_one(lambda: all_roots(run), UPLOAD_PRESCRIPTION_TITLE,
+                      prefer=["MenuItem", "Button"], skip=BUTTON_SKIP, timeout=2)
         if up is not None:
-            up.click_input()
-            upload = find_one(roots, UPLOAD_FILE_TITLE, prefer=["Button"], skip=skip, timeout=10)
+            click(run, up)
+            upload = the_only(run, UPLOAD_FILE_TITLE, "Upload file", timeout=10)
     if upload is None:
         raise RuntimeError("'Upload file' button not found after EMR prescription")
 
-    before = {safe(lambda: d.handle) for d in nexus_dialogs(pid)}
-    upload.click_input()
-    choose_file(pid, before, file_path)
+    before = handles_of(nexus_dialogs(run.pid))
+    click(run, upload)
+    choose_file(run, before, file_path)
     time.sleep(1)
 
-    sel = find_one(roots, SELECT_FILE_TITLE, prefer=["Button"], skip=skip, timeout=15)
+    sel = the_only(run, SELECT_FILE_TITLE, "Select file", timeout=15)
     if sel is None:
         raise RuntimeError("'Select file' button not found after choosing the file")
-    before = {safe(lambda: d.handle) for d in nexus_dialogs(pid)}
-    sel.click_input()
-    time.sleep(2.5)
+    pending = nexus_dialogs(run.pid)
+    if pending:
+        raise RuntimeError("Nexus showed a message before Select file: %s"
+                           % " | ".join(dialog_text(m) for m in pending))
+    if not wait_for(lambda: sel.is_enabled(), 10):
+        raise RuntimeError("'Select file' stayed disabled; nothing was attached")
 
-    msgs = new_dialogs(pid, before)
+    before = handles_of(nexus_windows(run.pid))
+    mark_pending(key, case_number)
+    state["clicked"] = True
+    try:
+        click(run, sel)
+        return after_select_file(run, before)
+    except Exception as e:
+        raise UncertainAttach(str(e)) from e
+
+
+def after_select_file(run, before):
+    # Watch for a message from Nexus for up to 10 s. No message = done (as on the real screen).
+    msgs = []
+    end = time.time() + 10
+    while time.time() < end:
+        if new_windows(run, before):
+            time.sleep(2)  # a short "uploading" window may close by itself
+            msgs = [w for w in new_windows(run, before) if is_visible(w)]
+            if msgs:
+                break
+        time.sleep(0.5)
     if not msgs:
         return ""
-    text = " | ".join(dialog_text(m) for m in msgs)
-    if re.search(ERROR_WORDS, text, re.IGNORECASE):
-        for m in msgs:
-            close_window(m)
-        raise RuntimeError("Nexus said after Select file: %s" % text)
+    texts = []
     for m in msgs:
-        close_window(m)
-    if any(is_visible(m) for m in msgs):
-        raise RuntimeError("Nexus is asking a question after Select file, answer it by hand: %s" % text)
-    return "Nexus said: %s" % text
+        text = dialog_text(m)
+        texts.append(text)
+        buttons = button_names(m)
+        if any(re.match(QUESTION_BUTTONS, b, re.IGNORECASE) for b in buttons):
+            raise RuntimeError("Nexus is asking after Select file, answer it by hand: %s" % text)
+        if re.search(ERROR_WORDS, text, re.IGNORECASE):
+            if window_class(m) == "#32770":
+                close_window(m)
+            raise RuntimeError("Nexus said after Select file: %s" % text)
+        if window_class(m) == "#32770" or any(re.match(r"^\s{0,}&?OK\s{0,}$", b, re.IGNORECASE) for b in buttons):
+            close_window(m)
+    return "Nexus said: %s" % " | ".join(t for t in texts if t)
 
 
-def cleanup(pid, before_dialogs):
-    import pyautogui
-    from pywinauto import Desktop
-    for d in new_dialogs(pid, before_dialogs):
-        close_window(d)
-    for w in Desktop(backend="uia").windows():
-        try:
-            if w.process_id() == pid and is_visible(w) and ctype(w) == "Menu":
-                assert_focus(pid)
-                pyautogui.press("escape")
-                break
-        except Exception:
-            pass
+def cleanup(run, before):
+    # Cancel dialogs this attempt opened and close an open right-click menu.
+    for d in nexus_dialogs(run.pid):
+        if safe(lambda: d.handle) not in before:
+            close_window(d)
+    if any(window_class(w) == "#32768" for w in nexus_windows(run.pid)):
+        escape_menu(run)
 
 
 def save_screenshot(path):
@@ -779,44 +1051,49 @@ def save_screenshot(path):
         logging.warning("Could not save screenshot: %s", e)
 
 
-def attach_in_nexus(case_number, case_date, file_path):
+def attach_in_nexus(case_number, case_date, file_path, key, state):
     win = find_main_window()
     if win is None:
         raise RuntimeError("Nexus Pro window not found (is it open and logged in?) Open windows: %s"
                            % ", ".join(visible_titles())[:300])
-    pid = win.process_id()
-    start_dialogs = {safe(lambda: d.handle) for d in nexus_dialogs(pid)}
-    if start_dialogs:
-        raise RuntimeError("A Nexus dialog is already open (%s); close it first"
-                           % dialog_text(nexus_dialogs(pid)[0]))
+    run = Run(win)
+    logging.info("Nexus window: '%s' (%s)", name_of(win), exe_of(run.pid))
+    dialogs = nexus_dialogs(run.pid)
+    if dialogs:
+        raise RuntimeError("A Nexus dialog is open (%s); close it first" % dialog_text(dialogs[0]))
+    close_leftover_upload_windows(run)
+    if not safe(win.is_enabled, True):
+        raise RuntimeError("The Nexus main window is blocked by another Nexus window; close it first")
+    start = handles_of(nexus_dialogs(run.pid))
     try:
         safe(win.set_focus)
         time.sleep(0.5)
+        if window_pid(foreground()) != run.pid:
+            raise RuntimeError("Nexus could not be brought to the front")
 
         # Patients menu
         patients = find_one([win], PATIENTS_TITLE, prefer=["MenuItem", "Button", "TabItem", "Text"])
         if patients is None:
             raise RuntimeError("'Patients' menu not found in Nexus Pro")
-        patients.click_input()
+        click(run, patients)
         time.sleep(1.5)
 
         # Date, Center, Case #
-        case_label, case_box, avoid, date_note = fill_search_form(win, pid, case_number, case_date)
+        case_label, case_box, avoid, notes = fill_search_form(run, case_number, case_date)
 
         # Search, then the record row
-        record = search_record(win, pid, case_number, case_label, case_box, avoid)
+        record = search_record(run, case_number, case_label, case_box, avoid)
         if not record:
-            raise RuntimeError("Record %s not found (Date %s %s, Center %s)"
-                               % (case_number, nexus_date_text(case_date), date_note, CENTER_VALUE))
+            raise RuntimeError("Record %s not found (%s)" % (case_number, notes))
         logging.info("Found record %s", case_number)
 
         # Right-click > EMR prescription > Upload file > file dialog > Select file
-        click_emr_prescription(win, pid, record)
+        click_emr_prescription(run, case_number, record, avoid)
         time.sleep(1)
-        return upload_file(win, pid, file_path)
+        return upload_file(run, case_number, file_path, key, state)
     except Exception:
         save_screenshot(file_path)
-        safe(lambda: cleanup(pid, start_dialogs))
+        safe(lambda: cleanup(run, start))
         raise
 
 
@@ -834,54 +1111,78 @@ def report(case_number, filename, status, reason=""):
         logging.error("Could not reach n8n: %s", e)
 
 
-def wait_until_stable(path, tries=20):
-    last = -1
+def file_complete(path):
+    # True when the scan is a whole file (the scanner has finished writing it).
+    try:
+        ext = path.suffix.lower()
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            n = f.tell()
+            f.seek(max(0, n - 4096))
+            tail = f.read()
+        if ext in (".jpg", ".jpeg"):
+            return b"\xff\xd9" in tail
+        if ext == ".pdf":
+            return b"%%EOF" in tail
+        if ext == ".png":
+            return b"IEND" in tail
+        from PIL import Image
+        with Image.open(path) as im:
+            for i in range(getattr(im, "n_frames", 1)):
+                im.seek(i)
+                im.load()
+        return True
+    except Exception:
+        return False
+
+
+def wait_until_stable(path, tries=120, need=3):
+    last, same = -1, 0
     for _ in range(tries):
         try:
             size = path.stat().st_size
         except FileNotFoundError:
             return False
-        if size == last and size > 0:
-            try:
-                with open(path, "rb"):
-                    return True
-            except OSError:
-                pass
+        same = same + 1 if (size == last and size > 0) else 0
+        if same >= need and file_complete(path):
+            return True
         last = size
         time.sleep(1)
     return False
 
 
 def ledger_key(path):
-    try:
-        size = path.stat().st_size
-    except OSError:
-        size = -1
-    return "%s\t%s" % (path.name.lower(), size)
+    return "%s\t%s" % (path.name.lower(), path.stat().st_size)
 
 
-def already_attached(key):
+def ledger_state(key):
+    # "attached", "pending" (Select file was clicked, result unknown) or None.
     try:
         lines = LEDGER.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return False
-    return any(line.startswith(key + "\t") for line in lines)
+    except FileNotFoundError:
+        return None
+    states = [line.split("\t")[3] for line in lines
+              if line.startswith(key + "\t") and len(line.split("\t")) > 3]
+    if "attached" in states:
+        return "attached"
+    return "pending" if states else None
 
 
 def remember_attached(key, case_number):
     try:
         with LEDGER.open("a", encoding="utf-8") as f:
-            f.write("%s\t%s\t%s\n" % (key, case_number, time.strftime("%Y-%m-%d %H:%M:%S")))
+            f.write("%s\t%s\tattached\t%s\n" % (key, case_number, time.strftime("%Y-%m-%d %H:%M:%S")))
     except OSError as e:
         logging.error("Could not write %s: %s", LEDGER, e)
 
 
 def move_file(path, folder):
-    dest = folder / path.name
-    if dest.exists():
-        dest = folder / ("%s_%s%s" % (path.stem, time.strftime("%Y%m%d-%H%M%S"), path.suffix))
     for _ in range(10):
         try:
+            folder.mkdir(exist_ok=True)
+            dest = folder / path.name
+            if dest.exists():
+                dest = folder / ("%s_%s%s" % (path.stem, time.strftime("%Y%m%d-%H%M%S"), path.suffix))
             shutil.move(str(path), str(dest))
             return True
         except FileNotFoundError:
@@ -892,33 +1193,54 @@ def move_file(path, folder):
     return False
 
 
+stuck = set()  # scans that could not be moved away; not picked up again by the rescan
+
+
+def finish(path, folder):
+    if not move_file(path, folder):
+        stuck.add(str(path))
+        return False
+    return True
+
+
 def process(path):
     case_number = None
+    key = None
+    state = {"clicked": False}
     try:
         if not wait_until_stable(path):
             if not path.exists():
                 logging.info("%s disappeared before it could be processed", path.name)
                 return
-            raise RuntimeError("File not readable / still being written")
+            raise RuntimeError("Scan is incomplete or still being written")
         key = ledger_key(path)
-        if already_attached(key):
-            logging.warning("%s was already attached earlier; not attaching it twice", path.name)
-            move_file(path, DONE_DIR)
-            report(safe(lambda: format_case_number(path.stem)), path.name, "skipped",
-                   "Already attached earlier; not attached again")
+        known = ledger_state(key)
+        if known:
+            logging.warning("%s was %s earlier; not attaching it again", path.name, known)
+            finish(path, DONE_DIR if known == "attached" else CHECK_DIR)
+            reason = ("Already attached earlier; not attached again" if known == "attached" else
+                      "An earlier attempt clicked Select file; check Nexus, then delete this scan's "
+                      "lines in attached_files.txt to retry")
+            report(safe(lambda: format_case_number(path.stem)), path.name, "skipped", reason)
             return
         case_number, case_date = case_from_file(path)
         logging.info("%s -> case %s, date %s", path.name, case_number, nexus_date_text(case_date))
-        note = attach_in_nexus(case_number, case_date, path)
+        note = attach_in_nexus(case_number, case_date, path, key, state)
     except Exception as e:
         logging.exception("Failed: %s", path.name)
         if case_number is None:
             case_number = safe(lambda: format_case_number(path.stem))
-        move_file(path, FAILED_DIR)
-        report(case_number, path.name, "failed", str(e))
+        if state["clicked"]:
+            finish(path, CHECK_DIR)
+            report(case_number, path.name, "uncertain",
+                   "Select file was clicked, then: %s. Check the record in Nexus; this scan will not "
+                   "be attached again automatically." % e)
+        else:
+            finish(path, FAILED_DIR)
+            report(case_number, path.name, "failed", str(e))
         return
     remember_attached(key, case_number)
-    if not move_file(path, DONE_DIR):
+    if not finish(path, DONE_DIR):
         note = (note + " " if note else "") + "(attached, but the scan could not be moved to done)"
     report(case_number, path.name, "success", note)
     logging.info("Attached %s -> %s", path.name, case_number)
@@ -930,7 +1252,7 @@ seen_lock = threading.Lock()
 
 
 def enqueue(p):
-    if p.suffix.lower() not in ALLOWED_EXT or p.parent != WATCH_DIR:
+    if p.suffix.lower() not in ALLOWED_EXT or p.parent != WATCH_DIR or str(p) in stuck:
         return
     with seen_lock:
         if str(p) in seen:
@@ -949,33 +1271,62 @@ class Handler(FileSystemEventHandler):
             enqueue(Path(event.dest_path))
 
 
+def start_observer():
+    obs = Observer()
+    obs.schedule(Handler(), str(WATCH_DIR), recursive=False)
+    obs.start()
+    return obs
+
+
+def rescan():
+    for p in sorted(WATCH_DIR.iterdir(), key=lambda q: safe(lambda: q.stat().st_mtime, 0)):
+        if safe(p.is_file, False):
+            enqueue(p)
+
+
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s",
                         filename="nexus_attach_agent.log")
     logging.getLogger().addHandler(logging.StreamHandler())
-    DONE_DIR.mkdir(exist_ok=True)
-    FAILED_DIR.mkdir(exist_ok=True)
-    obs = Observer()
-    obs.schedule(Handler(), str(WATCH_DIR), recursive=False)
-    obs.start()
-    logging.info("Watching %s", WATCH_DIR)
-    if PROCESS_EXISTING_ON_START:
-        for p in sorted(WATCH_DIR.iterdir(), key=lambda q: safe(lambda: q.stat().st_mtime, 0)):
-            if p.is_file():
-                enqueue(p)
+    for folder in (DONE_DIR, FAILED_DIR, CHECK_DIR):
+        folder.mkdir(exist_ok=True)
+    obs = start_observer()
+    logging.info("Watching %s (ledger: %s)", WATCH_DIR, LEDGER)
+    next_check = 0 if PROCESS_EXISTING_ON_START else time.time() + RESCAN_SECONDS
+    watcher_alerted = False
     try:
         while True:
+            if time.time() >= next_check:
+                next_check = time.time() + RESCAN_SECONDS
+                try:
+                    # The watcher stops for good after a network error on Z:, so restart it.
+                    if not obs.emitters or not all(e.is_alive() for e in obs.emitters):
+                        logging.error("Folder watcher stopped; restarting it")
+                        if not watcher_alerted:
+                            report("", "", "failed", "Folder watcher on Z: stopped (network?); restarting it")
+                            watcher_alerted = True
+                        safe(obs.stop)
+                        obs = start_observer()
+                    else:
+                        watcher_alerted = False
+                    rescan()
+                except Exception as e:
+                    logging.error("Cannot check %s: %s", WATCH_DIR, e)
             try:
                 p = work_queue.get(timeout=1)
             except queue.Empty:
                 continue
-            if p.exists():
-                process(p)
-            with seen_lock:
-                seen.discard(str(p))
+            try:
+                if p.exists():
+                    process(p)
+            except Exception as e:
+                logging.exception("Agent error on %s", p.name)
+                report(None, p.name, "failed", "Agent error, check Nexus before retrying: %s" % e)
+            finally:
+                with seen_lock:
+                    seen.discard(str(p))
     finally:
-        obs.stop()
-        obs.join()
+        safe(obs.stop)
 
 
 if __name__ == "__main__":
